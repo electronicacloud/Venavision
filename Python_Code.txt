@@ -1,0 +1,156 @@
+import cv2                                                                                                                 
+import numpy as np                                                                                                         
+import threading                                                                                                           
+import time                                                                                                                
+import os                                                                                                                  
+import subprocess                                                                                                          
+from flask import Flask, Response, request                                                                                 
+from skimage.filters import frangi                                                                                                                                                                              
+                                                                
+show_processed = True                                                                                                      
+
+class VideoStream:                                                                                                         
+    def __init__(self):                                                                                                                                                            
+        self.command = [                                                                                                   
+            'rpicam-vid', '-n', '-t', '0',                                                                                 
+            '--width', '640', '--height', '480',                                                                           
+            '--framerate', '24', '--codec', 'mjpeg',                                                                       
+            '--inline', '--flush', '-o', '-'                                                                               
+        ]                                                                                                                  
+        try:                                                                                                               
+            self.pipe = subprocess.Popen(self.command, stdout=subprocess.PIPE, bufsize=0)                                  
+            print("VenaVision: Camera Pipe Started with Reverted Math.")                                                   
+        except Exception as e:                                                                                             
+            print(f"CRITICAL ERROR: {e}")                                                                                  
+            self.pipe = None                                                                                               
+
+        self.buffer = b""                                                                                                  
+        self.frame = None                                                                                                  
+        self.success = False                                                                                               
+        self.stopped = False                                                                                               
+
+    def start(self):                                                                                                       
+        threading.Thread(target=self.update, args=(), daemon=True).start()                                                 
+        return self                                                                                                        
+
+    def update(self):                                                                                                      
+        while not self.stopped:                                                                                            
+            if self.pipe is None: break                                                                                    
+            chunk = self.pipe.stdout.read(10240)                                                                           
+            if not chunk: break                                                                                            
+            self.buffer += chunk                                                                                           
+                                              
+            last_eof = self.buffer.rfind(b'\xff\xd9')                                                                      
+            if last_eof != -1:                                                                                             
+                last_sof = self.buffer.rfind(b'\xff\xd8', 0, last_eof)                                                     
+                if last_sof != -1:                                                                                         
+                    jpg = self.buffer[last_sof:last_eof+2]                                                                 
+                    self.buffer = b""                                                                                      
+                    image = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)                             
+                    if image is not None:                                                                                  
+                        self.frame = image                                                                                 
+                        self.success = True                                                                                
+
+    def read(self):                                                                                                        
+        return self.frame if self.success else None                                                                        
+
+    def stop(self):                                                                                                        
+        self.stopped = True                                                                                                
+        if self.pipe:                                                                                                      
+            self.pipe.terminate()                                                                                          
+                                                                                 
+                                                                
+def process_vein_projection(frame):                                                                                        
+    if frame is None: return None                                                                                          
+    #1. ROI & Pre-processing ---                                                                                      
+    h, w = frame.shape[:2]                                                                                                 
+    y1, y2, x1, x2 = int(h*0.05), int(h*0.95), int(w*0.05), int(w*0.95)                                                     
+    raw_roi = frame[y1:y2, x1:x2]                                                                                          
+    roi_h, roi_w = raw_roi.shape[:2]                                                                                      
+                                                                       
+    small_color_bg = cv2.resize(raw_roi, (320, 240))                                                                                                                                                                     
+    gray = cv2.cvtColor(small_color_bg, cv2.COLOR_BGR_GRAY)                                                                
+    clahe = cv2.createCLAHE(clipLimit=3, tileGridSize=(8,8))                                                               
+    enhanced = clahe.apply(gray)                                                                                           
+    blurred = cv2.GaussianBlur(enhanced, (3, 3), 0)                                                                        
+                                                                                
+    vessels = frangi(blurred, sigmas=(1.25, 2.5), black_ridges=True)                                                      
+    vessels_8bit = (vessels * 255).astype(np.uint8)                                                                        
+    vessels_8bit = cv2.medianBlur(vessels_8bit, 3)                                                                         
+                                                                                  
+    _, arm_mask = cv2.threshold(enhanced, 10, 255, cv2.THRESH_BINARY)                                                      
+    inner_mask = cv2.erode(arm_mask, np.ones((11,11), np.uint8), iterations=3)                                             
+                                                                  
+    color_map = cv2.applyColorMap(vessels_8bit, cv2.COLORMAP_INFERNO)                                                      
+    glow_veins = cv2.bitwise_and(color_map, color_map, mask=inner_mask)                                                    
+    processed_small = cv2.addWeighted(small_color_bg, 0.5, glow_veins, 1.2, 0)                                                                                                               
+    return cv2.resize(processed_small, (roi_w, roi_h))                                                                     
+                                                                                             
+                                                                
+app = Flask(__name__)                                                                                                      
+vs = VideoStream().start()                                                                                                 
+
+def gen_frames():                                                                                                          
+    while True:                                                                                                            
+        frame = vs.read()                                                                                                  
+        if frame is None:                                                                                                  
+            time.sleep(0.01)                                                                                               
+            continue                                                                                                       
+
+        if show_processed:                                                                                                 
+            display_frame = process_vein_projection(frame)                                                                 
+        else:                                                                                                              
+            display_frame = frame                                                                                          
+                                                               
+        ret, buffer = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])                                   
+        yield (b'--frame\r\n'                                                                                              
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')                                           
+        time.sleep(0.04) # Control server FPS                                                                              
+
+@app.route('/video_feed')                                                                                                  
+def video_feed():                                                                                                          
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')                                     
+
+@app.route('/toggle_view', methods=['POST'])                                                                               
+def toggle_view():                                                                                                         
+    global show_processed                                                                                                  
+    show_processed = not show_processed                                                                                    
+    return ("OK", 200)                                                                                                     
+
+@app.route('/')                                                                                                            
+def index():                                                                                                               
+    return """                                                                                                             
+<!DOCTYPE html>                                                                                                            
+<html lang="en">                                                                                                           
+<head>                                                                                                                     
+    <meta charset="UTF-8">                                                                                                 
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">                                                 
+    <title>VenaVision - Vascular Mapping</title>                                                                           
+    <style>                                                                                                                
+        body { background: #020617; color: white; font-family: 'Segoe UI', sans-serif; text-align: center; margin: 0; }     
+        .header { padding: 30px; border-bottom: 2px solid #0ea5e9; margin-bottom: 20px; }                                  
+        h1 { color: #0ea5e9; letter-spacing: 3px; margin: 0; }                                                             
+        .main-display { max-width: 90%; margin: 0 auto; border: 3px solid #1e293b; border-radius: 15px; overflow: hidden; }
+        img { width: 100%; height: auto; display: block; }                                                                 
+        .btn { background: #0ea5e9; color: white; border: none; padding: 20px 40px; border-radius: 12px; font-size: 1.2rem; cursor: pointer; margin-top: 20px; transition: 0.3s; }
+        .btn:hover { background: #38bdf8; }                                                                                
+    </style>                                                                                                               
+    <script>                                                                                                               
+        function toggleOverlay() { fetch('/toggle_view', {method: 'POST'}); }                                              
+    </script>                                                                                                              
+</head>                                                                                                                    
+<body>                                                                                                                     
+    <div class="header">                                                                                                   
+        <h1>VENAVISION</h1>                                                                                                
+        <p>Smart Vein Detection in Real Time</p>                                                                          
+    </div>                                                                                                                 
+    <div class="main-display">                                                                                             
+        <img src="/video_feed">                                                                                            
+    </div>                                                                                                                 
+    <button class="btn" onclick="toggleOverlay()">TOGGLE VEIN ANALYSIS</button>                                            
+</body>                                                                                                                    
+</html>                                                                                                                    
+"""                                                                                                                        
+
+if __name__ == '__main__':                                                                                                 
+    app.run(host='0.0.0.0', port=5000, threaded=True, debug=False)
